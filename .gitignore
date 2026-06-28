@@ -1,0 +1,26 @@
+# Secrets and local auth
+.mcp_token
+prison_state.json
+
+# Runtime state (match/game data)
+strike_reset.flag
+code_green.json
+recent_events.json
+
+# Session logs (paths, match IDs, GSI payloads)
+logs/
+gsi_trace.jsonl
+gsi_trace.jsonl.old
+watcher.log
+
+# Cursor / IDE (may contain MCP tokens)
+.cursor/
+
+# Reference clone — not part of this project
+learning_material/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
