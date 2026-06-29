@@ -8,6 +8,8 @@ The watcher never kills Dota on its own for CODE GREEN — only Poke calls `exec
 
 ```
 Dota 2 (GSI)  →  watcher.py :3000  →  code_green.json / recent_events.json
+                      │
+                      └─ POKE_API_KEY set? → poke.com/api/v1/inbound/api-message (wake Poke)
 Poke (cloud)  →  ngrok        →  mcp_server.py :5000  →  execute / pardon / unlock
 ```
 
@@ -46,6 +48,9 @@ TypeShi/
   launch_prison.bat       Start watcher + ngrok + MCP
   config/mcp.json.example Optional Cursor MCP template
   .mcp_token.example      Auth token template (copy to .mcp_token)
+  .poke_api_key.example   Poke Kitchen V2 key template (copy to .poke_api_key)
+  poke_notify.py          Optional push to Poke inbound API on CODE GREEN
+  poke_test.py            Interactive menu to test Poke API messages
   logs/                   Session logs (gitignored)
 ```
 
@@ -80,7 +85,34 @@ setx MCP_AUTH_TOKEN "paste-the-same-token-here"
 
 Restart terminals after `setx`. The MCP server reads `MCP_AUTH_TOKEN` or `.mcp_token`.
 
-### 4. Run locally
+### 4. Poke alerts (webhook + api-message)
+
+**Poke only** — no separate Telegram bot. Two Poke channels on cheese pick:
+
+1. **Webhook** (event trigger — tells Poke *what to do* on Telegram) — run once:
+   ```cmd
+   pip install -r requirements.txt
+   python setup_poke_webhook.py
+   ```
+   Saves `.poke_webhook.json` (gitignored).
+
+2. **api-message** (simple text like texting Poke):
+   ```json
+   {"message": "CODE GREEN: i drafted meepo in match 8873293507. reply on telegram, check dota prison mcp get_code_green(), then pardon or execute."}
+   ```
+
+Kitchen **V2 key** in `.poke_api_key` — **same Poke account** as Telegram.
+
+Test:
+```cmd
+python poke_test.py
+```
+Pick **2** → check Telegram for Poke 🌴.
+
+If `success: true` but Poke never replies, ask Poke on Telegram:
+*"My script posts to api-message and webhook — why no telegram reply? Same Kitchen key."*
+
+### 5. Run locally
 
 ```powershell
 launch_prison.bat
@@ -95,7 +127,7 @@ set NGROK_DOMAIN=your-subdomain.ngrok-free.dev
 launch_prison.bat
 ```
 
-### 5. Connect Poke
+### 6. Connect Poke (MCP — for execute / pardon / unlock)
 
 1. Start ngrok and note the public URL (e.g. `https://xxxx.ngrok-free.dev/mcp/`).
 2. In Poke MCP settings:
@@ -103,9 +135,9 @@ launch_prison.bat
    - **API key:** same value as `.mcp_token`
 3. Reconnect MCP after tool changes.
 
-**Recommended:** use `wait_for_code_green(120)` in a loop instead of slow polling — blocks until CODE GREEN or timeout.
+With `POKE_API_KEY` set, Poke is pushed on CODE GREEN; MCP is still required for local actions (`execute_code_green`, `pardon_code_green`, `unlock_dota`).
 
-### 6. Cursor MCP (optional)
+### 7. Cursor MCP (optional)
 
 Copy `config/mcp.json.example` to `.cursor/mcp.json` and set your ngrok URL + `${env:MCP_AUTH_TOKEN}`. The `.cursor/` folder is gitignored.
 
@@ -143,6 +175,7 @@ Debug verbosity: `set DOTA_PRISON_LOG=DEBUG` before starting the watcher.
 **Never commit:**
 
 - `.mcp_token` — MCP bearer secret
+- `.poke_api_key` — Poke inbound API key
 - `.cursor/mcp.json` — may contain tokens
 - `logs/`, `code_green.json`, `recent_events.json`, `prison_state.json` — local game data
 

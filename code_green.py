@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -10,11 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from poke_instructions import TEST_GAMEMODE
+
 ROOT = Path(__file__).resolve().parent
 CODE_GREEN_FILE = ROOT / "code_green.json"
 STRIKE_RESET_FILE = ROOT / "strike_reset.flag"
 PRISON_STATE = ROOT / "prison_state.json"
 
+logger = logging.getLogger("dota_prison.code_green")
 _lock = threading.Lock()
 
 VIOLATIONS: dict[str, dict[str, str]] = {
@@ -206,7 +210,14 @@ def pardon_code_green(notes: str = "") -> tuple[bool, dict[str, Any]]:
     return True, payload
 
 
-def execute_code_green() -> tuple[bool, dict[str, Any]]:
+def is_dry_run_alert(alert: dict[str, Any]) -> bool:
+    details = alert.get("details") or {}
+    if details.get("dry_run") is True:
+        return True
+    return details.get("gamemode") == TEST_GAMEMODE
+
+
+def execute_code_green(*, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
     with _lock:
         alert = _read_alert()
         if alert is None:
@@ -216,27 +227,49 @@ def execute_code_green() -> tuple[bool, dict[str, Any]]:
                 "message": "No CODE GREEN alert is active.",
             }
 
+    if dry_run or is_dry_run_alert(alert):
+        clear_code_green()
+        request_strike_reset()
+        logger.info("execute_code_green dry_run — skipped taskkill")
+        return True, {
+            "action": "execute",
+            "ok": True,
+            "dry_run": True,
+            "message": "Dry run: CODE GREEN cleared without terminating Dota.",
+            "violation": alert,
+        }
+
     result = subprocess.run(
         ["taskkill", "/IM", "dota2.exe", "/F"],
         capture_output=True,
         text=True,
         check=False,
     )
+    logger.info(
+        "taskkill dota2.exe rc=%s stderr=%r",
+        result.returncode,
+        result.stderr.strip(),
+    )
 
     clear_code_green()
     request_strike_reset()
 
-    if result.returncode != 0:
+    if result.returncode not in (0, 128):
         return False, {
             "action": "execute",
             "ok": False,
             "message": f"taskkill failed (rc={result.returncode}): {result.stderr.strip()}",
+            "taskkill_rc": result.returncode,
             "violation": alert,
         }
+
+    if result.returncode == 128:
+        logger.info("taskkill rc=128 — dota2.exe not running (already dead?)")
 
     return True, {
         "action": "execute",
         "ok": True,
         "message": "Dota 2 terminated. CODE GREEN cleared.",
+        "taskkill_rc": result.returncode,
         "violation": alert,
     }
