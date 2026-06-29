@@ -1,0 +1,9 @@
+# Demo pitch — lead with zero-handshake + total delta (run poke_v2_demo.py for live numbers)
+
+ZERO-HANDSHAKE | total delta: ~7900ms (~7.9s end-to-end) — demoable
+
+path: skip_ack -> execute_code_green (no poke_api_ack, no 18s handshake tax)
+breakdown: local webhook ~643ms | cloud vaporization ~7700ms (Poke + ngrok — the cooked part)
+
+One-liner for Marvin/Felix:
+Dota Digital Prison v2: zero-handshake CODE GREEN, ~7.9s violation-to-execute (was ~18s+ with handshake).

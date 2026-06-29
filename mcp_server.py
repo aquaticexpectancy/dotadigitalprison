@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -14,11 +15,14 @@ from fastmcp import FastMCP
 from fastmcp.server.auth import StaticTokenVerifier
 
 from code_green import (
-    execute_code_green as run_execute_code_green,
+    clear_code_green,
+    execute_code_green_async,
     get_code_green as read_code_green,
     pardon_code_green as run_pardon_code_green,
     prison_status,
+    request_strike_reset,
 )
+from local_vaporize import is_dota_running
 from events import format_violation, get_last_violation, get_recent_events
 from poke_ack import (
     read_ack as read_poke_ack,
@@ -93,13 +97,13 @@ def write_prison_state(unlocked_until: float) -> None:
 
 
 @mcp.tool
-def get_prison_status() -> str:
+async def get_prison_status() -> str:
     """Return prison lock state and any active CODE GREEN alert as JSON."""
     return _json(prison_status())
 
 
 @mcp.tool
-def get_code_green() -> str:
+async def get_code_green() -> str:
     """Return the active CODE GREEN alert as JSON, or inactive status."""
     log_tool_call("get_code_green", {})
     alert = read_code_green()
@@ -109,7 +113,7 @@ def get_code_green() -> str:
 
 
 @mcp.tool
-def wait_for_code_green(timeout_seconds: int = 120) -> str:
+async def wait_for_code_green(timeout_seconds: int = 120) -> str:
     """Block until CODE GREEN is active or timeout. Prefer this over polling get_prison_status."""
     timeout_seconds = max(1, min(timeout_seconds, 300))
     started = time.time()
@@ -127,7 +131,7 @@ def wait_for_code_green(timeout_seconds: int = 120) -> str:
                     "prison": prison_status(),
                 }
             )
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
     return _json(
         {
@@ -141,7 +145,7 @@ def wait_for_code_green(timeout_seconds: int = 120) -> str:
 
 
 @mcp.tool
-def get_gsi_trace_tail(limit: int = 20) -> str:
+async def get_gsi_trace_tail(limit: int = 20) -> str:
     """Return the last N lines from the latest session gsi_trace.jsonl."""
     limit = max(1, min(limit, 100))
     session = load_latest_session()
@@ -174,16 +178,49 @@ def get_gsi_trace_tail(limit: int = 20) -> str:
 
 
 @mcp.tool
-def execute_code_green(dry_run: bool = False) -> str:
+async def verify_local_vaporization() -> str:
+    """Confirm watcher already killed dota2.exe; clear CODE GREEN without taskkill."""
+    log_tool_call("verify_local_vaporization", {})
+    running = await is_dota_running()
+    alert = read_code_green()
+    if alert is None:
+        return _json(
+            {
+                "ok": False,
+                "dota_running": running,
+                "corpse_cold": not running,
+                "message": "No CODE GREEN alert active.",
+            }
+        )
+    clear_code_green()
+    request_strike_reset()
+    return _json(
+        {
+            "ok": True,
+            "dota_running": running,
+            "corpse_cold": not running,
+            "code_green_cleared": True,
+            "violation": alert,
+            "message": (
+                "Corpse cold — local vaporization verified."
+                if not running
+                else "WARNING: dota2.exe still running after local_killed webhook."
+            ),
+        }
+    )
+
+
+@mcp.tool
+async def execute_code_green(dry_run: bool = False) -> str:
     """Terminate Dota 2 and clear CODE GREEN. Use dry_run=true for pipeline tests."""
     log_tool_call("execute_code_green", {"dry_run": dry_run})
-    _ok, payload = run_execute_code_green(dry_run=dry_run)
+    _ok, payload = await execute_code_green_async(dry_run=dry_run)
     log_tool_call("execute_code_green", {"dry_run": dry_run}, result_ok=_ok)
     return _json(payload)
 
 
 @mcp.tool
-def pardon_code_green(notes: str = "") -> str:
+async def pardon_code_green(notes: str = "") -> str:
     """Clear CODE GREEN without terminating Dota. Resets feed strikes in the watcher."""
     log_tool_call("pardon_code_green", {"notes": notes[:80] if notes else ""})
     _ok, payload = run_pardon_code_green(notes)
@@ -191,7 +228,7 @@ def pardon_code_green(notes: str = "") -> str:
 
 
 @mcp.tool
-def unlock_dota(hours: int = 2) -> str:
+async def unlock_dota(hours: int = 2) -> str:
     """Grant temporary prison unlock (disables enforcement until expiry)."""
     unlocked_until = time.time() + (hours * 3600)
     write_prison_state(unlocked_until)
@@ -207,7 +244,7 @@ def unlock_dota(hours: int = 2) -> str:
 
 
 @mcp.tool
-def get_handshake_token() -> str:
+async def get_handshake_token() -> str:
     """Return the pending API handshake token. Use this EXACT value in poke_api_ack."""
     pending = read_handshake_pending()
     if pending is None:
@@ -223,8 +260,9 @@ def get_handshake_token() -> str:
 
 
 @mcp.tool
-def poke_api_ack(ping_token: str, message: str = "got your api call") -> str:
+async def poke_api_ack(ping_token: str, message: str = "got your api call") -> str:
     """Acknowledge a Poke inbound API message. Call this when api-message/handshake arrives."""
+    log_tool_call("poke_api_ack", {"ping_token": ping_token, "message": message})
     payload = write_poke_ack(ping_token, message, source="poke_mcp")
     matched = payload.get("token_matched")
     print(
@@ -236,7 +274,7 @@ def poke_api_ack(ping_token: str, message: str = "got your api call") -> str:
 
 
 @mcp.tool
-def get_poke_api_ack() -> str:
+async def get_poke_api_ack() -> str:
     """Return the latest poke_api_ack flag (proof Poke received api-message via MCP)."""
     ack = read_poke_ack()
     if ack is None:
@@ -245,14 +283,14 @@ def get_poke_api_ack() -> str:
 
 
 @mcp.tool
-def get_last_prison_violation() -> str:
+async def get_last_prison_violation() -> str:
     """Return the most recent logged violation as JSON."""
     entry = get_last_violation()
     return _json({"violation": entry})
 
 
 @mcp.tool
-def get_recent_prison_violations(limit: int = 10) -> str:
+async def get_recent_prison_violations(limit: int = 10) -> str:
     """Return recent logged violations as JSON."""
     return _json({"violations": get_recent_events(limit)})
 
@@ -263,6 +301,7 @@ if __name__ == "__main__":
         "get_prison_status",
         "get_code_green",
         "wait_for_code_green",
+        "verify_local_vaporization",
         "execute_code_green",
         "pardon_code_green",
         "unlock_dota",

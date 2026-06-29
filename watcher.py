@@ -1,24 +1,36 @@
-"""Dota 2 Digital Prison GSI watcher."""
+"""Dota 2 Digital Prison GSI watcher — FastAPI async receiver."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import signal
 import threading
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from code_green import consume_strike_reset, raise_code_green, violation_meta
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+import uvicorn
+
+from code_green import (
+    clear_stale_code_green,
+    consume_strike_reset,
+    get_code_green,
+    raise_code_green,
+    violation_meta,
+)
+from poke_http import close_http_client, get_http_client
 from poke_notify import notify_code_green
 from events import append_event
 from gsi_trace import append_trace, build_trace_record, init_trace_file, trace_path
 from session_log import start_session
+from poke_pipeline import pipeline_status
 
 ROOT = Path(__file__).resolve().parent
 PRISON_STATE = ROOT / "prison_state.json"
@@ -172,14 +184,16 @@ def request_code_green(reason: str, event: str, **details: Any) -> bool:
 
 
 def maybe_flag_forbidden_hero(cache: GameStateCache, enforce: bool) -> None:
+    hero_name = cache.hero_name
+    match_id = cache.match_id
     if not enforce:
         return
 
-    hero_name = cache.hero_name
-    if not isinstance(hero_name, str) or hero_name not in FORBIDDEN_HEROES:
+    if not isinstance(hero_name, str):
+        return
+    if hero_name not in FORBIDDEN_HEROES:
         return
 
-    match_id = cache.match_id
     if match_id and match_id in _cheese_flagged_matches:
         return
 
@@ -191,8 +205,25 @@ def maybe_flag_forbidden_hero(cache: GameStateCache, enforce: bool) -> None:
         timer_label=cache.timer_label(),
         match_id=match_id,
     )
-    if created and match_id:
+    if created:
+        if match_id:
+            _cheese_flagged_matches.add(match_id)
+        logger.warning(
+            "CHEESE detected | hero=%s | match=%s — CODE GREEN raised, notifying Poke",
+            hero_name,
+            match_id,
+        )
+        return
+
+    existing = get_code_green()
+    if existing and match_id:
         _cheese_flagged_matches.add(match_id)
+    logger.info(
+        "CHEESE hero=%s match=%s — already flagged (code_green.json still active; "
+        "pardon/execute via MCP or delete code_green.json to re-test)",
+        hero_name,
+        match_id,
+    )
 
 
 class GameStateCache:
@@ -506,13 +537,14 @@ def log_gsi_heartbeat(payload: dict[str, Any], locked: bool) -> None:
     sections = [key for key in ("map", "player", "hero", "provider") if key in payload]
     logger.info(
         "GSI heartbeat #%s | locked=%s | sections=%s | %s | mode=%s | "
-        "state=%s | deaths=%s | lh=%s | xp=%s | xpm=%s | pos=%s | strikes=%s",
+        "state=%s | hero=%s | deaths=%s | lh=%s | xp=%s | xpm=%s | pos=%s | strikes=%s",
         _gsi_payload_count,
         locked,
         sections,
         cache.timer_label(),
         cache.gamemode or "?",
         cache.game_state or "?",
+        cache.hero_name or "?",
         cache.last_deaths_seen if cache.last_deaths_seen is not None else "?",
         cache.last_hits if cache.last_hits is not None else "?",
         cache.hero_xp if cache.hero_xp is not None else "?",
@@ -526,81 +558,62 @@ def log_gsi_heartbeat(payload: dict[str, Any], locked: bool) -> None:
     )
 
 
-class GSIHandler(BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args: Any) -> None:
+async def process_gsi_payload(body: bytes) -> None:
+    global _gsi_payload_count
+
+    if not body:
+        logger.debug("Empty GSI POST body")
         return
 
-    def do_POST(self) -> None:
-        global _gsi_payload_count
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        logger.warning("Malformed GSI JSON: %s", exc)
+        return
 
-        body = self._read_body()
-        self._send_ok()
+    if not isinstance(payload, dict):
+        logger.warning("GSI payload is not a JSON object")
+        return
 
-        if not body:
-            logger.debug("Empty GSI POST body")
-            return
+    _gsi_payload_count += 1
+    locked = is_locked()
+    log_gsi_heartbeat(payload, locked)
 
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as exc:
-            logger.warning("Malformed GSI JSON: %s", exc)
-            return
+    if consume_strike_reset():
+        feed_tracker.reset_strikes()
+        logger.info("Feed strikes reset by Poke pardon/execute.")
 
-        if not isinstance(payload, dict):
-            logger.warning("GSI payload is not a JSON object")
-            return
+    feed_tracker._cache.update(payload)
+    vaporize = request_code_green if locked else noop_vaporize
+    enforce = locked
 
-        _gsi_payload_count += 1
-        locked = is_locked()
-        log_gsi_heartbeat(payload, locked)
+    maybe_flag_forbidden_hero(feed_tracker._cache, enforce)
+    feed_tracker.update(payload, vaporize, enforce)
 
-        if consume_strike_reset():
-            feed_tracker.reset_strikes()
-            logger.info("Feed strikes reset by Poke pardon/execute.")
-
-        feed_tracker._cache.update(payload)
-        vaporize = request_code_green if locked else noop_vaporize
-        enforce = locked
-
-        maybe_flag_forbidden_hero(feed_tracker._cache, enforce)
-        feed_tracker.update(payload, vaporize, enforce)
-
-        append_trace(
-            build_trace_record(
-                seq=_gsi_payload_count,
-                payload=payload,
-                cache=feed_tracker._cache,
-            )
+    append_trace(
+        build_trace_record(
+            seq=_gsi_payload_count,
+            payload=payload,
+            cache=feed_tracker._cache,
         )
+    )
 
-    def _read_body(self) -> bytes:
-        length_header = self.headers.get("Content-Length")
-        if not length_header:
-            return b""
 
-        try:
-            length = int(length_header)
-        except ValueError:
-            logger.warning("Invalid Content-Length header: %r", length_header)
-            return b""
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await get_http_client()
+    yield
+    await close_http_client()
 
-        if length <= 0:
-            return b""
 
-        try:
-            return self.rfile.read(length)
-        except OSError as exc:
-            logger.warning("Failed to read request body: %s", exc)
-            return b""
+app = FastAPI(lifespan=lifespan)
 
-    def _send_ok(self) -> None:
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        except OSError as exc:
-            logger.warning("Failed to send response: %s", exc)
+
+@app.post("/")
+async def gsi_post(request: Request) -> PlainTextResponse:
+    body = await request.body()
+    asyncio.create_task(process_gsi_payload(body))
+    return PlainTextResponse("ok")
 
 
 def main() -> None:
@@ -619,8 +632,18 @@ def main() -> None:
     logger.addHandler(file_handler)
 
     locked = is_locked()
+    clear_stale_code_green()
+    pipe = pipeline_status()
+    if not pipe.get("mcp_port_open"):
+        logger.warning("MCP server not listening on :5000 — launch_prison.bat MCP window?")
+    elif pipe.get("poke_mcp_likely_stale"):
+        ngrok = pipe.get("ngrok") or {}
+        logger.warning(
+            "ngrok tunnel up (%s) but zero HTTP hits — Poke MCP URL may be stale in Kitchen",
+            ngrok.get("public_url"),
+        )
     logger.info(
-        "Dota Digital Prison watcher on http://%s:%s/ | prison_locked=%s",
+        "Dota Digital Prison watcher (FastAPI) on http://%s:%s/ | prison_locked=%s",
         HOST,
         PORT,
         locked,
@@ -633,21 +656,13 @@ def main() -> None:
             "Prison is UNLOCKED — you will see death logs but no vaporize until locked"
         )
 
-    server = HTTPServer((HOST, PORT), GSIHandler)
-
-    def shutdown(_signum: int | None = None, _frame: Any | None = None) -> None:
-        logger.info("Shutting down...")
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGINT, shutdown)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, shutdown)
-
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        logger.info("Watcher stopped.")
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level=log_level.lower(),
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

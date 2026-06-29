@@ -1,14 +1,14 @@
 Paste this to Poke on Telegram once (or save in Kitchen / memory).
 
 ---
-Dota Digital Prison — CODE GREEN
+Dota Digital Prison — CODE GREEN v2 (zero-handshake)
 
-Default notify: webhook (POKE_NOTIFY_MODE=webhook). Every alert has execute_token=XXXX.
+Default: webhook + skip_ack=true → execute_code_green on MCP (no poke_api_ack).
+Set POKE_REQUIRE_ACK=1 only for the slow handshake path (~18s).
 
-1. poke_api_ack(ping_token=execute_token) on Dota Prison MCP
-2. execute_code_green() — or execute_code_green(dry_run=true) for TEST/dry_run
-3. Telegram: man u messed up say gg
+CHEESE / FEEDING: Poke calls execute_code_green() (or dry_run for tests), then Telegram roast.
+Watcher raises CODE GREEN and webhooks — does NOT taskkill locally.
 
-CHEESE: instant execute. TEST/dry_run: dry_run only. FEEDING: warn 60s then execute.
-Kill first, roast second.
+MCP URL must match ngrok: https://triage-buffer-buffing.ngrok-free.dev/mcp/
+Re-paste this brief if Poke stops responding after ngrok/MCP restart.
 ---

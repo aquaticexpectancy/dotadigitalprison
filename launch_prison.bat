@@ -18,6 +18,9 @@ if not defined NGROK_DOMAIN (
 echo ngrok domain: !NGROK_DOMAIN!
 set "NGROK_CMD=ngrok http 5000 --url=!NGROK_DOMAIN!"
 
+call "%PROJECT%\stop_prison.bat"
+timeout /t 2 /nobreak >nul
+
 start "Dota Prison - Watcher" cmd /k "cd /d %PROJECT% && python watcher.py"
 timeout /t 2 /nobreak >nul
 start "Dota Prison - MCP Server" cmd /k "cd /d %PROJECT% && python mcp_server.py"

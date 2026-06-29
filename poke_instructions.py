@@ -2,38 +2,44 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
-# Webhook trigger action (max 500 chars — enforced in setup_poke_webhook.py)
+# Webhook trigger action (max 500 chars — enforced in setup_poke_webhook.py).
 WARDEN_ACTION = (
-    "CODE GREEN webhook. Read execute_token and dry_run from payload. "
-    "Dota Prison MCP same turn: poke_api_ack(ping_token=execute_token), "
-    "then execute_code_green(dry_run=true) if dry_run else execute_code_green(). "
-    "Then Telegram roast. No status msgs. No wait."
+    "CODE GREEN webhook. Read execute_token, dry_run, skip_ack from payload. "
+    "If skip_ack: execute_code_green(dry_run=true) if dry_run else execute_code_green(). "
+    "Else: poke_api_ack(ping_token=execute_token), then same execute. "
+    "Telegram roast after. No status. No wait."
 )
 
 KITCHEN_BRIEF = """Paste this to Poke on Telegram once (or save in Kitchen / memory).
 
 ---
-Dota Digital Prison — CODE GREEN
+Dota Digital Prison — CODE GREEN v2 (zero-handshake)
 
-Webhook OR api-message (not both at once — use POKE_NOTIFY_MODE=webhook default).
+Default: webhook + skip_ack=true → execute_code_green on MCP (no poke_api_ack).
+Set POKE_REQUIRE_ACK=1 only for the slow handshake path (~18s).
 
-Every alert includes execute_token=XXXX in the payload/message.
-
-1. poke_api_ack(ping_token=execute_token) on Dota Prison MCP
-2. Then execute_code_green() — or execute_code_green(dry_run=true) for TEST/dry_run alerts
-3. Then Telegram: man u messed up say gg
-
-CHEESE: instant execute (step 2 without dry_run).
-TEST / dry_run: execute_code_green(dry_run=true) only — never taskkill.
-FEEDING: Telegram warn first, 60s to pardon, then execute.
-
-Kill first, roast second. Watcher does NOT auto-kill.
+CHEESE / FEEDING: Poke calls execute_code_green() (or dry_run for tests), then Telegram roast.
+Watcher raises CODE GREEN and webhooks — does NOT taskkill locally.
 ---
 """
 
 TEST_GAMEMODE = "poke_execute_flow_test"
+
+
+def skip_ack_enabled(explicit: bool | None = None) -> bool:
+    """v2 default: skip handshake unless POKE_REQUIRE_ACK=1 or explicit False."""
+    if explicit is not None:
+        return explicit
+    require = os.environ.get("POKE_REQUIRE_ACK", "").strip().lower()
+    if require in {"1", "true", "yes"}:
+        return False
+    legacy_off = os.environ.get("POKE_SKIP_ACK", "").strip().lower()
+    if legacy_off in {"0", "false", "no"}:
+        return False
+    return True
 
 
 def hero_label(hero: object) -> str:
@@ -51,16 +57,28 @@ def is_test_alert(alert: dict[str, Any]) -> bool:
     return details.get("gamemode") == TEST_GAMEMODE
 
 
-def build_notify_message(alert: dict[str, Any], execute_token: str) -> str:
-    """One notify payload — includes handshake token (proven to trigger MCP)."""
+def build_notify_message(
+    alert: dict[str, Any],
+    execute_token: str,
+    *,
+    skip_ack: bool | None = None,
+    local_killed: bool = False,
+) -> str:
+    """One notify payload — skip_ack default; local_killed ignored (legacy field)."""
+    _ = local_killed
     jailed_reason = alert.get("jailed_reason") or alert.get("event") or "violation"
     details = alert.get("details") or {}
     match_id = details.get("match_id", "unknown")
     hero = hero_label(details.get("hero"))
-    mcp = (
-        f"execute_token={execute_token}. "
-        f"MCP order: poke_api_ack(ping_token={execute_token}), "
-    )
+    use_skip_ack = skip_ack_enabled(skip_ack)
+
+    if use_skip_ack:
+        mcp = "skip_ack=true. MCP: "
+    else:
+        mcp = (
+            f"execute_token={execute_token}. "
+            f"MCP order: poke_api_ack(ping_token={execute_token}), "
+        )
 
     if is_test_alert(alert):
         return (
@@ -79,5 +97,5 @@ def build_notify_message(alert: dict[str, Any], execute_token: str) -> str:
 
     return (
         f"CODE GREEN cheese {hero} match {match_id}. {mcp}"
-        f"execute_code_green(). After kill, telegram: man u messed up say gg."
+        f"execute_code_green(). After kill, telegram roast."
     )
