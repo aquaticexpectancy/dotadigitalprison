@@ -1,19 +1,23 @@
-"""Push CODE GREEN to Poke — webhook default (automation trigger + handshake token)."""
+"""Push CODE GREEN to Poke — async httpx webhook, v2 zero-handshake default."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import secrets
-import threading
 from pathlib import Path
 from typing import Any
 
-from poke import Poke
-
 from poke_ack import set_pending
-from poke_instructions import build_notify_message, hero_label, is_test_alert
+from poke_http import send_api_message_async, send_webhook_async
+from poke_instructions import (
+    build_notify_message,
+    hero_label,
+    is_test_alert,
+    skip_ack_enabled,
+)
 
 logger = logging.getLogger("dota_prison.poke")
 
@@ -21,9 +25,7 @@ ROOT = Path(__file__).resolve().parent
 POKE_KEY_FILE = ROOT / ".poke_api_key"
 POKE_WEBHOOK_FILE = ROOT / ".poke_webhook.json"
 
-# webhook = automation trigger (default, most reliable for MCP).
-# api = api-message only. both = webhook + one api (worked in early tests; may duplicate agents).
-POKE_NOTIFY_MODE = os.environ.get("POKE_NOTIFY_MODE", "webhook").strip().lower()
+POKE_NOTIFY_MODE = os.environ.get("POKE_NOTIFY_MODE", "both").strip().lower()
 
 
 def read_secret_file(path: Path) -> str:
@@ -68,13 +70,25 @@ def issue_execute_token() -> str:
     return token
 
 
-def build_code_green_message(alert: dict[str, Any], execute_token: str) -> str:
-    return build_notify_message(alert, execute_token)
+def build_code_green_message(
+    alert: dict[str, Any],
+    execute_token: str,
+    *,
+    skip_ack: bool | None = None,
+) -> str:
+    return build_notify_message(alert, execute_token, skip_ack=skip_ack)
 
 
-def build_webhook_payload(alert: dict[str, Any], execute_token: str) -> dict[str, Any]:
+def build_webhook_payload(
+    alert: dict[str, Any],
+    execute_token: str,
+    *,
+    skip_ack: bool | None = None,
+    local_killed: bool = False,
+) -> dict[str, Any]:
     details = alert.get("details") or {}
     hero = details.get("hero")
+    use_skip_ack = skip_ack_enabled(skip_ack)
     return {
         "event": "code_green",
         "jailed_reason": alert.get("jailed_reason") or alert.get("event"),
@@ -82,70 +96,86 @@ def build_webhook_payload(alert: dict[str, Any], execute_token: str) -> dict[str
         "hero": hero,
         "hero_label": hero_label(hero),
         "summary": alert.get("summary"),
-        "execute_token": execute_token,
+        "execute_token": execute_token if not use_skip_ack else "",
+        "skip_ack": use_skip_ack,
+        "local_killed": local_killed,
         "dry_run": is_test_alert(alert),
-        "message": build_notify_message(alert, execute_token),
+        "message": build_notify_message(
+            alert,
+            execute_token,
+            skip_ack=skip_ack,
+            local_killed=local_killed,
+        ),
     }
 
 
-def poke_client() -> Poke | None:
+def send_to_poke(message: str) -> tuple[bool, str, dict[str, Any] | None]:
+    """Sync api-message — tests and setup scripts only."""
     api_key = load_poke_api_key()
     if not api_key:
-        return None
-    return Poke(api_key=api_key)
-
-
-def send_to_poke(message: str) -> tuple[bool, str, dict[str, Any] | None]:
-    client = poke_client()
-    if client is None:
         return False, "No Poke API key", None
-    try:
-        result = client.send_message(message)
-    except Exception as exc:
-        return False, str(exc), None
-    if result.get("success"):
-        return True, result.get("message", "sent"), result
-    return False, str(result), result
+    return asyncio.run(send_api_message_async(api_key, message))
 
 
-def send_webhook(alert: dict[str, Any], execute_token: str) -> tuple[bool, str]:
+async def send_webhook(
+    alert: dict[str, Any],
+    execute_token: str,
+    *,
+    skip_ack: bool | None = None,
+    local_killed: bool = False,
+) -> tuple[bool, str]:
     hook = load_poke_webhook()
-    client = poke_client()
     if hook is None:
         return False, "No .poke_webhook.json — run: python setup_poke_webhook.py"
-    if client is None:
+    if not load_poke_api_key():
         return False, "No Poke API key"
-    try:
-        result = client.send_webhook(
-            webhook_url=hook["webhookUrl"],
-            webhook_token=hook["webhookToken"],
-            data=build_webhook_payload(alert, execute_token),
-        )
-    except Exception as exc:
-        return False, str(exc)
-    if result.get("success"):
-        return True, "webhook fired"
-    return False, str(result)
+    return await send_webhook_async(
+        hook["webhookUrl"],
+        hook["webhookToken"],
+        build_webhook_payload(
+            alert,
+            execute_token,
+            skip_ack=skip_ack,
+            local_killed=local_killed,
+        ),
+    )
 
 
-def notify_code_green_sync(alert: dict[str, Any]) -> dict[str, Any]:
-    """Send notify synchronously — for tests and diagnostics."""
+async def notify_code_green_async(
+    alert: dict[str, Any],
+    *,
+    skip_ack: bool | None = None,
+    local_killed: bool = False,
+) -> dict[str, Any]:
     if not load_poke_api_key():
         return {"ok": False, "error": "No Poke API key"}
 
     mode = POKE_NOTIFY_MODE
-    execute_token = issue_execute_token()
-    message = build_notify_message(alert, execute_token)
+    use_skip_ack = skip_ack_enabled(skip_ack)
+    execute_token = "" if use_skip_ack else issue_execute_token()
+    message = build_notify_message(
+        alert,
+        execute_token,
+        skip_ack=skip_ack,
+        local_killed=local_killed,
+    )
     result: dict[str, Any] = {
         "mode": mode,
-        "execute_token": execute_token,
+        "skip_ack": use_skip_ack,
+        "local_killed": local_killed,
+        "execute_token": execute_token or None,
         "message": message,
         "webhook_ok": None,
         "api_ok": None,
     }
 
     if mode in {"webhook", "both"}:
-        wh_ok, wh_detail = send_webhook(alert, execute_token)
+        wh_ok, wh_detail = await send_webhook(
+            alert,
+            execute_token,
+            skip_ack=skip_ack,
+            local_killed=local_killed,
+        )
         result["webhook_ok"] = wh_ok
         result["webhook_detail"] = wh_detail
         if wh_ok:
@@ -154,11 +184,12 @@ def notify_code_green_sync(alert: dict[str, Any]) -> dict[str, Any]:
             logger.warning("Poke webhook failed: %s", wh_detail)
 
     if mode in {"api", "both"}:
-        ok, detail, _resp = send_to_poke(message)
+        api_key = load_poke_api_key()
+        ok, detail, _body = await send_api_message_async(api_key, message)
         result["api_ok"] = ok
         result["api_detail"] = detail
         if ok:
-            logger.info("Poke api-message sent: %s", message[:120])
+            logger.info("Poke api-message sent for CODE GREEN")
         else:
             logger.error("Poke api-message failed: %s", detail)
 
@@ -171,13 +202,45 @@ def notify_code_green_sync(alert: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _notify_thread(alert: dict[str, Any]) -> None:
-    notify_code_green_sync(alert)
+def notify_code_green_sync(
+    alert: dict[str, Any],
+    *,
+    skip_ack: bool | None = None,
+) -> dict[str, Any]:
+    return asyncio.run(notify_code_green_async(alert, skip_ack=skip_ack))
+
+
+def fire_and_forget_code_green(alert: dict[str, Any], *, local_killed: bool = False) -> None:
+    """Background webhook after local taskkill — never blocks GSI handler."""
+    if not load_poke_api_key():
+        logger.debug("No Poke API key — skipping warden report")
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(
+            notify_code_green_async(alert, skip_ack=True, local_killed=local_killed)
+        )
+        return
+    loop.create_task(
+        notify_code_green_async(alert, skip_ack=True, local_killed=local_killed)
+    )
 
 
 def notify_code_green(alert: dict[str, Any]) -> None:
-    """Notify Poke (default: webhook automation with execute_token)."""
+    """Schedule async notify — prefer notify_code_green_async from async contexts."""
     if not load_poke_api_key():
         logger.debug("No Poke API key — set POKE_API_KEY or create .poke_api_key")
         return
-    threading.Thread(target=_notify_thread, args=(alert,), daemon=True).start()
+    use_skip = skip_ack_enabled(None)
+    logger.info(
+        "CODE GREEN notify queued | skip_ack=%s | jailed_reason=%s",
+        use_skip,
+        alert.get("jailed_reason") or alert.get("event"),
+    )
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(notify_code_green_async(alert, skip_ack=use_skip))
+        return
+    loop.create_task(notify_code_green_async(alert, skip_ack=use_skip))

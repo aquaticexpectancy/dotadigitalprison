@@ -58,6 +58,7 @@ def main() -> None:
         print("  2. cheese CODE GREEN (single api-message via notify_code_green)")
         print("  3. dry_run test alert (no taskkill)")
         print("  4. API -> MCP handshake test")
+        print("  5. v2 demo receipts (skip_ack dry_run)")
         print("  q. quit")
         choice = input("> ").strip().lower()
         if choice in {"q", "quit"}:
@@ -72,6 +73,12 @@ def main() -> None:
             import subprocess
 
             subprocess.run([sys.executable, str(root / "poke_handshake_test.py")], cwd=str(root))
+            continue
+        if choice == "5":
+            root = Path(__file__).resolve().parent
+            import subprocess
+
+            subprocess.run([sys.executable, str(root / "poke_v2_demo.py")], cwd=str(root))
             continue
         if choice == "3":
             alert = fake_cheese_alert(dry_run=True)

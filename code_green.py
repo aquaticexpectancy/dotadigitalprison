@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import subprocess
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -157,6 +158,32 @@ def raise_code_green(
         return alert, True
 
 
+STALE_CODE_GREEN_SECONDS = float(
+    os.environ.get("STALE_CODE_GREEN_SECONDS", "600")
+)
+
+
+def clear_stale_code_green() -> bool:
+    """Drop CODE GREEN from a prior run (hero demo always uses match_id=0)."""
+    with _lock:
+        alert = _read_alert()
+        if alert is None:
+            return False
+        details = alert.get("details") or {}
+        match_id = str(details.get("match_id", ""))
+        age = time.time() - float(alert.get("timestamp", 0))
+        demo_match = match_id in {"0", ""}
+        if not demo_match and age <= STALE_CODE_GREEN_SECONDS:
+            return False
+        summary = alert.get("summary") or alert.get("event")
+        if CODE_GREEN_FILE.is_file():
+            CODE_GREEN_FILE.unlink(missing_ok=True)
+
+    reason = "hero demo match_id=0" if demo_match else f"{age:.0f}s old"
+    logger.warning("Cleared stale CODE GREEN (%s): %s", reason, summary)
+    return True
+
+
 def get_code_green() -> dict[str, Any] | None:
     with _lock:
         return _read_alert()
@@ -217,7 +244,21 @@ def is_dry_run_alert(alert: dict[str, Any]) -> bool:
     return details.get("gamemode") == TEST_GAMEMODE
 
 
-def execute_code_green(*, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
+async def _taskkill_dota_async() -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "taskkill",
+        "/IM",
+        "dota2.exe",
+        "/F",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    rc = proc.returncode if proc.returncode is not None else -1
+    return rc, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
+
+
+async def execute_code_green_async(*, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
     with _lock:
         alert = _read_alert()
         if alert is None:
@@ -239,37 +280,33 @@ def execute_code_green(*, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
             "violation": alert,
         }
 
-    result = subprocess.run(
-        ["taskkill", "/IM", "dota2.exe", "/F"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    logger.info(
-        "taskkill dota2.exe rc=%s stderr=%r",
-        result.returncode,
-        result.stderr.strip(),
-    )
+    rc, _stdout, stderr = await _taskkill_dota_async()
+    logger.info("taskkill dota2.exe rc=%s stderr=%r", rc, stderr.strip())
 
     clear_code_green()
     request_strike_reset()
 
-    if result.returncode not in (0, 128):
+    if rc not in (0, 128):
         return False, {
             "action": "execute",
             "ok": False,
-            "message": f"taskkill failed (rc={result.returncode}): {result.stderr.strip()}",
-            "taskkill_rc": result.returncode,
+            "message": f"taskkill failed (rc={rc}): {stderr.strip()}",
+            "taskkill_rc": rc,
             "violation": alert,
         }
 
-    if result.returncode == 128:
+    if rc == 128:
         logger.info("taskkill rc=128 — dota2.exe not running (already dead?)")
 
     return True, {
         "action": "execute",
         "ok": True,
         "message": "Dota 2 terminated. CODE GREEN cleared.",
-        "taskkill_rc": result.returncode,
+        "taskkill_rc": rc,
         "violation": alert,
     }
+
+
+def execute_code_green(*, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
+    """Sync wrapper for tests — MCP uses execute_code_green_async."""
+    return asyncio.run(execute_code_green_async(dry_run=dry_run))

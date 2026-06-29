@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import secrets
 import socket
@@ -11,7 +12,7 @@ import time
 from code_green import clear_code_green, get_code_green, raise_code_green
 from mcp_log import MCP_LOG
 from poke_ack import read_ack
-from poke_instructions import TEST_GAMEMODE
+from poke_instructions import TEST_GAMEMODE, skip_ack_enabled
 from poke_notify import (
     POKE_NOTIFY_MODE,
     load_poke_api_key,
@@ -67,12 +68,22 @@ def mcp_dry_run_since(since: float) -> bool:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Poke CODE GREEN execute flow test (dry_run).")
+    parser.add_argument(
+        "--skip-ack",
+        action="store_true",
+        help="Set skip_ack=true in webhook payload (no poke_api_ack handshake).",
+    )
+    args = parser.parse_args()
+    use_skip_ack = skip_ack_enabled(True if args.skip_ack else None)
+
     if not load_poke_api_key():
         print("Missing .poke_api_key")
         sys.exit(1)
 
     print("Poke execute flow test (dry_run — will NOT taskkill Dota)")
     print(f"  POKE_NOTIFY_MODE={POKE_NOTIFY_MODE}")
+    print(f"  skip_ack={use_skip_ack}")
 
     if not mcp_port_open():
         print("  FAIL: MCP not listening on :5000 — run launch_prison.bat first")
@@ -89,7 +100,7 @@ def main() -> None:
     clear_code_green()
     started = time.time()
     alert = fake_test_alert()
-    sent = notify_code_green_sync(alert)
+    sent = notify_code_green_sync(alert, skip_ack=use_skip_ack)
     print(f"  execute_token: {sent.get('execute_token')}")
     print(f"  webhook_ok: {sent.get('webhook_ok')}  api_ok: {sent.get('api_ok')}")
     if sent.get("webhook_detail"):
@@ -104,18 +115,19 @@ def main() -> None:
     cleared_at: float | None = None
     mcp_at: float | None = None
     ack_at: float | None = None
-    token = str(sent.get("execute_token", ""))
+    token = str(sent.get("execute_token") or "")
 
     while time.time() < deadline:
-        ack = read_ack()
-        if (
-            ack_at is None
-            and ack
-            and ack.get("token_matched") is True
-            and str(ack.get("ping_token")) == token
-            and float(ack.get("timestamp", 0)) >= started
-        ):
-            ack_at = time.time()
+        if not use_skip_ack and token:
+            ack = read_ack()
+            if (
+                ack_at is None
+                and ack
+                and ack.get("token_matched") is True
+                and str(ack.get("ping_token")) == token
+                and float(ack.get("timestamp", 0)) >= started
+            ):
+                ack_at = time.time()
         if mcp_at is None and mcp_dry_run_since(started):
             mcp_at = time.time()
         if get_code_green() is None:
@@ -124,7 +136,9 @@ def main() -> None:
         time.sleep(POLL_INTERVAL)
 
     print()
-    if ack_at is not None:
+    if use_skip_ack:
+        print("  poke_api_ack: skipped (skip_ack=true)")
+    elif ack_at is not None:
         print(f"  poke_api_ack matched (~{ack_at - started:.1f}s)")
     else:
         print("  poke_api_ack: not seen (is ngrok + MCP connected in Poke?)")

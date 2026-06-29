@@ -33,6 +33,7 @@ def main() -> None:
     print("Creating Poke webhook trigger...")
     print(f"  condition: {WARDEN_CONDITION}")
     print(f"  action ({action_len} chars): {WARDEN_ACTION[:80]}...")
+    print("  NOTE: re-run after poke_instructions.WARDEN_ACTION changes (branches on skip_ack).")
 
     try:
         result = client.create_webhook(condition=WARDEN_CONDITION, action=WARDEN_ACTION)
@@ -41,8 +42,12 @@ def main() -> None:
         return
 
     POKE_WEBHOOK_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    brief_path = POKE_WEBHOOK_FILE.parent / "config" / "poke_agent_brief.txt"
+    brief_path.parent.mkdir(parents=True, exist_ok=True)
+    brief_path.write_text(KITCHEN_BRIEF.strip() + "\n", encoding="utf-8")
     print()
     print(f"Saved to {POKE_WEBHOOK_FILE}")
+    print(f"Agent brief synced to {brief_path}")
     print("Test: python poke_execute_flow_test.py")
     print()
     print("Re-paste brief to Poke if you changed poke_instructions.py:")
