@@ -9,14 +9,15 @@ import signal
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from code_green import consume_strike_reset, raise_code_green
+from code_green import consume_strike_reset, raise_code_green, violation_meta
+from poke_notify import notify_code_green
 from events import append_event
 from gsi_trace import append_trace, build_trace_record, init_trace_file, trace_path
-from lane_map import is_on_lane
 from session_log import start_session
 
 ROOT = Path(__file__).resolve().parent
@@ -33,10 +34,6 @@ PORT = 3000
 FEED_STRIKES_REQUIRED = 5
 FEED_STRIKE_RESET_SECONDS = 60.0
 HEARTBEAT_LOG_SECONDS = 30.0
-LANE_GRIEF_EVAL_GAME_SECONDS = 600.0
-LANE_PRESENCE_MIN = 0.38
-LANE_GRIEF_MIN_POSITION_SAMPLES = 25
-LANE_GRIEF_TRACK_START_GAME_SECONDS = 30.0
 
 logger = logging.getLogger("dota_prison")
 
@@ -45,6 +42,7 @@ _last_heartbeat_log = 0.0
 _last_unlocked_notice = 0.0
 _gsi_payload_count = 0
 _cheese_flagged_matches: set[str] = set()
+_feed_supplement_notified: set[str] = set()
 
 
 def is_locked() -> bool:
@@ -118,12 +116,48 @@ def noop_vaporize(reason: str, event: str, **details: Any) -> None:
     logger.info("Feed threshold hit but prison is unlocked — no enforcement (%s)", event)
 
 
+def maybe_notify_feed_supplement(
+    event: str, reason: str, details: dict[str, Any]
+) -> bool:
+    """Notify Poke about feeding once when cheese CODE GREEN is already active."""
+    match_id = details.get("match_id")
+    key = str(match_id) if match_id is not None else "_unknown"
+    if key in _feed_supplement_notified:
+        return False
+    _feed_supplement_notified.add(key)
+
+    meta = violation_meta(event, details)
+    append_event(event, reason, details)
+    alert: dict[str, Any] = {
+        "active": True,
+        "code": "green",
+        "timestamp": time.time(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "event": meta["event"],
+        "jailed_reason": meta["jailed_reason"],
+        "label": meta["label"],
+        "summary": meta["summary"],
+        "reason": reason,
+        "details": details,
+        "supplement": True,
+    }
+    logger.warning(
+        "CODE GREEN feed supplement notify | match=%s strikes=%s — primary alert still active",
+        match_id,
+        details.get("strikes"),
+    )
+    notify_code_green(alert)
+    return True
+
+
 def request_code_green(reason: str, event: str, **details: Any) -> bool:
     """Raise CODE GREEN once per violation. Returns True if a new alert was created."""
     with _vaporize_lock:
         alert, created = raise_code_green(event, reason, details)
 
     if not created:
+        if event == "excessive_feeding":
+            maybe_notify_feed_supplement(event, reason, details)
         return False
 
     append_event(event, reason, details)
@@ -133,6 +167,7 @@ def request_code_green(reason: str, event: str, **details: Any) -> bool:
         alert.get("jailed_reason"),
         alert.get("summary"),
     )
+    notify_code_green(alert)
     return True
 
 
@@ -178,7 +213,6 @@ class GameStateCache:
         self.hero_alive: bool | None = None
         self.xpos: float | None = None
         self.ypos: float | None = None
-        self.on_lane: bool | None = None
 
     def update(self, payload: dict[str, Any]) -> None:
         map_data = payload.get("map")
@@ -248,11 +282,6 @@ class GameStateCache:
             ypos = as_float(hero.get("ypos"))
             if ypos is not None:
                 self.ypos = ypos
-
-        if self.xpos is not None and self.ypos is not None:
-            self.on_lane = is_on_lane(self.xpos, self.ypos)
-        else:
-            self.on_lane = None
 
     def timer_seconds(self) -> float | None:
         if self.game_time is not None:
@@ -457,238 +486,6 @@ class FeedTracker:
 feed_tracker = FeedTracker()
 
 
-def expected_xpm(game_time_seconds: float, turbo: bool) -> float:
-    minutes = game_time_seconds / 60.0
-    baseline = 140.0 + minutes * 33.0
-    return baseline * (1.35 if turbo else 1.0)
-
-
-def expected_lhpm(game_time_seconds: float, turbo: bool) -> float:
-    minutes = game_time_seconds / 60.0
-    baseline = 1.8 + minutes * 0.38
-    return baseline * (1.45 if turbo else 1.0)
-
-
-class LaneGriefTracker:
-    """Track lane presence, XP/min, and LH/min for the first 10 minutes."""
-
-    def __init__(self) -> None:
-        self._match_id: str | None = None
-        self._evaluated = False
-        self._position_samples = 0
-        self._on_lane_samples = 0
-        self._track_start_game_time: float | None = None
-        self._start_xp: int | None = None
-        self._start_last_hits: int | None = None
-        self._last_xp: int | None = None
-        self._last_last_hits: int | None = None
-
-    def reset_match(self, match_id: str | None) -> None:
-        self._match_id = match_id
-        self._evaluated = False
-        self._position_samples = 0
-        self._on_lane_samples = 0
-        self._track_start_game_time = None
-        self._start_xp = None
-        self._start_last_hits = None
-        self._last_xp = None
-        self._last_last_hits = None
-
-    def _maybe_baseline(self, cache: GameStateCache) -> None:
-        game_time = cache.game_time
-        if game_time is None or game_time < LANE_GRIEF_TRACK_START_GAME_SECONDS:
-            return
-        if self._track_start_game_time is not None:
-            return
-
-        xp = cache.hero_xp
-        last_hits = cache.last_hits
-        if xp is None or last_hits is None:
-            return
-
-        self._track_start_game_time = game_time
-        self._start_xp = xp
-        self._start_last_hits = last_hits
-        self._last_xp = xp
-        self._last_last_hits = last_hits
-        logger.info(
-            "Lane grief tracking started at %s | baseline xp=%s lh=%s",
-            cache.timer_label(),
-            xp,
-            last_hits,
-        )
-
-    def _sample_position(self, cache: GameStateCache) -> None:
-        if cache.paused:
-            return
-        if cache.hero_alive is False:
-            return
-
-        if cache.xpos is None or cache.ypos is None:
-            return
-
-        self._position_samples += 1
-        if cache.on_lane:
-            self._on_lane_samples += 1
-
-    def trace_snapshot(self, cache: GameStateCache | None = None) -> dict[str, Any]:
-        lane_pct: float | None = None
-        if self._position_samples > 0:
-            lane_pct = round(self._on_lane_samples / self._position_samples, 3)
-
-        missing: list[str] = []
-        if self._track_start_game_time is None and cache is not None:
-            if cache.hero_xp is None:
-                missing.append("hero_xp")
-            if cache.last_hits is None:
-                missing.append("last_hits")
-        if cache is not None:
-            if cache.xpos is None:
-                missing.append("xpos")
-            if cache.ypos is None:
-                missing.append("ypos")
-
-        return {
-            "evaluated": self._evaluated,
-            "baseline_set": self._track_start_game_time is not None,
-            "track_start_game_time": self._track_start_game_time,
-            "position_samples": self._position_samples,
-            "on_lane_samples": self._on_lane_samples,
-            "lane_presence_pct": lane_pct,
-            "start_xp": self._start_xp,
-            "start_last_hits": self._start_last_hits,
-            "last_xp": self._last_xp,
-            "last_last_hits": self._last_last_hits,
-            "missing_for_baseline": missing,
-        }
-
-    def _evaluate(
-        self,
-        cache: GameStateCache,
-        flag_callback: Callable[..., None],
-        enforce: bool,
-    ) -> None:
-        if self._evaluated:
-            return
-        self._evaluated = True
-
-        game_time = cache.game_time or LANE_GRIEF_EVAL_GAME_SECONDS
-        turbo = cache.gamemode == "Turbo"
-        flags: list[str] = []
-        metrics: dict[str, Any] = {
-            "gamemode": cache.gamemode,
-            "timer_label": cache.timer_label(),
-            "match_id": cache.match_id,
-            "game_time": game_time,
-            "position_samples": self._position_samples,
-        }
-
-        if self._position_samples >= LANE_GRIEF_MIN_POSITION_SAMPLES:
-            lane_pct = self._on_lane_samples / self._position_samples
-            metrics["lane_presence_pct"] = round(lane_pct, 3)
-            metrics["on_lane_samples"] = self._on_lane_samples
-            if lane_pct < LANE_PRESENCE_MIN:
-                flags.append("off_lane")
-        else:
-            metrics["lane_presence_pct"] = None
-            logger.warning(
-                "Lane grief: skipped off_lane check — only %s/%s position samples "
-                "(GSI may not be sending hero.xpos/ypos — check session gsi_trace.jsonl)",
-                self._position_samples,
-                LANE_GRIEF_MIN_POSITION_SAMPLES,
-            )
-
-        elapsed_minutes: float | None = None
-        avg_xpm: float | None = None
-        avg_lhpm: float | None = None
-
-        if (
-            self._track_start_game_time is not None
-            and self._start_xp is not None
-            and self._start_last_hits is not None
-            and self._last_xp is not None
-            and self._last_last_hits is not None
-        ):
-            elapsed_seconds = game_time - self._track_start_game_time
-            if elapsed_seconds >= 120.0:
-                elapsed_minutes = elapsed_seconds / 60.0
-                xp_gained = max(0, self._last_xp - self._start_xp)
-                lh_gained = max(0, self._last_last_hits - self._start_last_hits)
-                avg_xpm = xp_gained / elapsed_minutes
-                avg_lhpm = lh_gained / elapsed_minutes
-                metrics["avg_xpm"] = round(avg_xpm, 1)
-                metrics["avg_lhpm"] = round(avg_lhpm, 2)
-                metrics["expected_xpm"] = round(expected_xpm(game_time, turbo), 1)
-                metrics["expected_lhpm"] = round(expected_lhpm(game_time, turbo), 2)
-                metrics["xp_gained"] = xp_gained
-                metrics["last_hits_gained"] = lh_gained
-                metrics["track_minutes"] = round(elapsed_minutes, 1)
-
-                if avg_xpm < expected_xpm(game_time, turbo):
-                    flags.append("low_xp")
-                if avg_lhpm < expected_lhpm(game_time, turbo):
-                    flags.append("low_last_hits")
-
-        locked_note = "" if enforce else " [UNLOCKED — log only]"
-        logger.info(
-            "Lane grief 10-min report%s | flags=%s | lane=%s | xpm=%s | lhpm=%s",
-            locked_note,
-            flags or "none",
-            metrics.get("lane_presence_pct"),
-            metrics.get("avg_xpm"),
-            metrics.get("avg_lhpm"),
-        )
-
-        if not flags:
-            if self._track_start_game_time is None:
-                logger.warning(
-                    "Lane grief: no XP/LH baseline set by 10 min — "
-                    "hero.xp or player.last_hits never arrived in GSI"
-                )
-            return
-
-        metrics["flags"] = flags
-        flag_callback(
-            "Lane grief check failed in the first 10 minutes.",
-            "lane_grief",
-            **metrics,
-        )
-
-    def update(
-        self,
-        cache: GameStateCache,
-        flag_callback: Callable[..., None],
-        enforce: bool,
-    ) -> None:
-        if self._evaluated:
-            return
-
-        game_time = cache.game_time
-        if game_time is None:
-            return
-
-        if cache.match_id and self._match_id and cache.match_id != self._match_id:
-            self.reset_match(cache.match_id)
-        if cache.match_id:
-            self._match_id = cache.match_id
-
-        self._maybe_baseline(cache)
-
-        if cache.hero_xp is not None:
-            self._last_xp = cache.hero_xp
-        if cache.last_hits is not None:
-            self._last_last_hits = cache.last_hits
-
-        if game_time <= LANE_GRIEF_EVAL_GAME_SECONDS:
-            self._sample_position(cache)
-
-        if game_time >= LANE_GRIEF_EVAL_GAME_SECONDS:
-            self._evaluate(cache, flag_callback, enforce)
-
-
-lane_grief_tracker = LaneGriefTracker()
-
-
 def log_gsi_heartbeat(payload: dict[str, Any], locked: bool) -> None:
     global _last_heartbeat_log, _last_unlocked_notice
 
@@ -767,14 +564,12 @@ class GSIHandler(BaseHTTPRequestHandler):
 
         maybe_flag_forbidden_hero(feed_tracker._cache, enforce)
         feed_tracker.update(payload, vaporize, enforce)
-        lane_grief_tracker.update(feed_tracker._cache, vaporize, enforce)
 
         append_trace(
             build_trace_record(
                 seq=_gsi_payload_count,
                 payload=payload,
                 cache=feed_tracker._cache,
-                lane_grief=lane_grief_tracker.trace_snapshot(feed_tracker._cache),
             )
         )
 

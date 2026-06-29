@@ -1,11 +1,16 @@
 # Secrets and local auth
 .mcp_token
+.poke_api_key
+.poke_webhook.json
+.ngrok_domain
 prison_state.json
 
 # Runtime state (match/game data)
 strike_reset.flag
 code_green.json
 recent_events.json
+poke_api_ack.json
+poke_handshake_pending.json
 
 # Session logs (paths, match IDs, GSI payloads)
 logs/

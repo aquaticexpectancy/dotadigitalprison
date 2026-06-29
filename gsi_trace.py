@@ -55,7 +55,6 @@ def build_trace_record(
     seq: int,
     payload: dict[str, Any],
     cache: Any,
-    lane_grief: dict[str, Any] | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
     sections = sorted(key for key in payload if key != "provider")
@@ -96,9 +95,7 @@ def build_trace_record(
             "hero_alive": cache.hero_alive,
             "xpos": cache.xpos,
             "ypos": cache.ypos,
-            "on_lane": cache.on_lane,
         },
-        "lane_grief": lane_grief or {},
     }
 
     if map_in_payload and isinstance(map_payload, dict):
